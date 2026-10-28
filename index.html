@@ -544,6 +544,14 @@ body.readonly .g-check { pointer-events: none; }
       <button class="round" id="sClose" aria-label="Close"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
     </div>
     <div class="modal-body">
+      <div class="share-sec" id="sPlanSec">
+        <h3>Share the week plan</h3>
+        <p>Send a link that opens this week's meals as a read-only plan. They can add the meals to their own week with one tap. If you change meals later, share a new link.</p>
+        <div class="row"><button class="btn-primary" id="sLink">Copy link</button><button class="btn-ghost" id="sImg">Share as picture</button></div>
+        <input class="field" id="sLinkField" type="text" readonly aria-label="Link to this week's plan" hidden>
+        <div class="status-line" id="sPlanState" aria-live="polite"></div>
+      </div>
+      <div class="divider" id="sPlanDiv"></div>
       <div class="share-sec">
         <h3>Send as a message</h3>
         <p>Copy the menu and paste it into WhatsApp, a text or an email. Works for anyone.</p>
@@ -921,13 +929,164 @@ function renderStrip() {
   const strip = $('sharedStrip');
   if (view) {
     strip.hidden = false;
-    strip.innerHTML = `<span><strong>Shared plan</strong> · read-only, updates live</span><span class="spacer"></span><button class="chip-btn" id="leaveView">Back to my planner</button>`;
+    strip.innerHTML = view.fromLink
+      ? `<span><strong>A week plan shared with you</strong> · read-only</span><span class="spacer"></span><button class="chip-btn on" id="addLinked">Add these meals to my week</button><button class="chip-btn" id="leaveView">Back to my planner</button>`
+      : `<span><strong>Shared plan</strong> · read-only, updates live</span><span class="spacer"></span><button class="chip-btn" id="leaveView">Back to my planner</button>`;
     return;
   }
   const others = isOwner ? [] : Object.entries(state.shared).sort((a, b) => (b[1].weekStart || '').localeCompare(a[1].weekStart || '')).slice(0, 4);
   strip.hidden = !others.length;
   if (others.length) strip.innerHTML = `<span><strong>Shared with you:</strong></span>` + others.map(([k, d]) => `<button class="chip-btn" data-view="${k}">${labelFor(d)}</button>`).join('');
 }
+/* ── Share a plan by link (data lives in the link) ────── */
+function ymd(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function b64urlEncode(str) { const bytes = new TextEncoder().encode(str); let bin = ''; bytes.forEach(b => { bin += String.fromCharCode(b); }); return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+function b64urlDecode(code) { const b = code.replace(/-/g, '+').replace(/_/g, '/'); const bin = atob(b + '==='.slice((b.length + 3) % 4)); return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))); }
+function encodePlan() {
+  const wk = W(), s = {};
+  for (let d = 0; d < 7; d++) for (const [m] of MEALS) { const sl = wk.slots[d + m]; const r = meal(sl); if (r) s[d + m] = sl.dessert ? [r.name, sl.dessert.name] : [r.name]; }
+  return b64urlEncode(JSON.stringify({ v: 1, w: ymd(WS()), s }));
+}
+function planLink() { return location.href.split('#')[0] + '#plan=' + encodePlan(); }
+function dessertG(name) { const g = { ...guess(name) }; g.sugar = Math.max(1, g.sugar || 0); return g; }
+function enterLinkView(obj) {
+  viewMap = {}; const slots = {};
+  for (const [k, arr] of Object.entries(obj.s || {})) {
+    if (!/^[0-6][LD]$/.test(k) || !Array.isArray(arr) || typeof arr[0] !== 'string') continue;
+    const name = arr[0].slice(0, 90);
+    viewMap['s:' + k] = { id: 's:' + k, name, g: guess(name), when: 'B' };
+    slots[k] = { id: 's:' + k };
+    if (typeof arr[1] === 'string' && arr[1]) slots[k].dessert = { name: arr[1].slice(0, 60), g: dessertG(arr[1]) };
+  }
+  view = { key: 'link', fromLink: true, raw: obj, weekStart: monday(parseDay(obj.w)), week: { slots, extras: {} }, targets: defaultTargets() };
+  document.body.classList.add('readonly');
+  render();
+}
+function checkPlanHash() {
+  if (window.claude || !location.hash.startsWith('#plan=')) return false;
+  try { const obj = JSON.parse(b64urlDecode(location.hash.slice(6))); if (obj && obj.w && obj.s) { enterLinkView(obj); return true; } } catch (e) {}
+  return false;
+}
+function addLinkedMeals() {
+  const raw = view.raw, ws = view.weekStart;
+  goToWeek(ws);
+  try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+  let added = 0, kept = 0;
+  let custom = state.settings.custom || [];
+  for (const [k, arr] of Object.entries(raw.s || {})) {
+    if (!/^[0-6][LD]$/.test(k) || !Array.isArray(arr) || typeof arr[0] !== 'string') continue;
+    if (meal(state.week.slots[k])) { kept++; continue; }
+    const name = arr[0].slice(0, 90), g = guess(name);
+    state.week.slots[k] = { name, g };
+    custom = custom.filter(r => r.name.toLowerCase() !== name.toLowerCase()); custom.push({ id: 'c' + Date.now().toString(36) + k, name, when: 'C', g });
+    if (typeof arr[1] === 'string' && arr[1]) {
+      const dn = arr[1].slice(0, 60), dg = dessertG(dn);
+      state.week.slots[k].dessert = { name: dn, g: dg };
+      custom = custom.filter(r => r.name.toLowerCase() !== dn.toLowerCase()); custom.push({ id: 'c' + Date.now().toString(36) + k + 'd', name: dn, when: 'S', g: dg });
+    }
+    added++;
+  }
+  state.settings.custom = custom.slice(-80);
+  saveSettings(); saveWeek(); render();
+  setSaveState(added ? `Added ${added} meal${added === 1 ? '' : 's'} to your week${kept ? `, kept ${kept} you already had` : ''}` : 'Your week already had meals in those slots');
+}
+
+/* ── Share the week as a picture ────────────────────── */
+function wrapText(ctx, text, maxW, maxLines) {
+  const words = text.split(/\s+/); const lines = []; let line = '';
+  for (const w of words) {
+    const t = line ? line + ' ' + w : w;
+    if (ctx.measureText(t).width <= maxW || !line) line = t; else { lines.push(line); line = w; }
+  }
+  if (line) lines.push(line);
+  if (lines.length > maxLines) { lines.length = maxLines; lines[maxLines - 1] = lines[maxLines - 1].replace(/\s*\S*$/, '') + '…'; }
+  return lines;
+}
+async function drawWeekImage() {
+  try { await Promise.all([document.fonts.load('700 28px Caveat'), document.fonts.load('600 12px Inter'), document.fonts.load('600 30px Fredoka')]); } catch (e) {}
+  const css = getComputedStyle(document.documentElement);
+  const tok = n => css.getPropertyValue(n).trim();
+  const Wd = 1400, padX = 40, headH = 96, dayH = 56, rowH = 200, footH = 46;
+  const Hd = 32 + headH + dayH + rowH * 2 + footH + 24;
+  const scale = 2, cv = document.createElement('canvas'); cv.width = Wd * scale; cv.height = Hd * scale;
+  const ctx = cv.getContext('2d'); ctx.scale(scale, scale);
+  const hand = '"Caveat", "Segoe Print", cursive', ui = '"Inter", system-ui, sans-serif';
+  const light = { sheet: '#ffffff', paper: '#fffdf8', green: '#00483a', green2: '#0f6b55', stroke: '#a9cbbd', heading: '#10261f', micro: '#5f766d', week: '#b8a090',
+    dc: ['#f5f0d0', '#fce8d4', '#ddf0d0', '#d0e8f8', '#e8e0f8', '#c8eee0', '#f5e0e4'] };
+  const gcol = { veg: '#4f9a46', fruit: '#d87848', legumes: '#7f8a2e', grains: '#9478c8', fish: '#3f86b4', poultry: '#b07a4a', redmeat: '#c0464a', sugar: '#e2b10f' };
+  ctx.fillStyle = light.paper; ctx.fillRect(0, 0, Wd, Hd);
+  const x0 = padX, y0 = 32, gw = Wd - padX * 2, colW = gw / 7;
+  // frame + header band
+  ctx.save(); ctx.beginPath(); ctx.roundRect(x0, y0, gw, headH + dayH + rowH * 2, 12); ctx.clip();
+  ctx.fillStyle = light.sheet; ctx.fillRect(x0, y0, gw, headH + dayH + rowH * 2);
+  ctx.fillStyle = light.green; ctx.fillRect(x0, y0, gw, headH);
+  ctx.fillStyle = light.green2; ctx.fillRect(x0, y0 + headH - 4, gw, 4);
+  const ws = WS(), we = addDays(ws, 6);
+  ctx.fillStyle = '#ffffff'; ctx.textBaseline = 'middle';
+  ctx.font = `700 46px ${hand}`; ctx.fillText(`Week ${isoWeek(ws)}`, x0 + 26, y0 + headH / 2);
+  ctx.font = `700 30px ${hand}`; ctx.textAlign = 'right';
+  ctx.fillText(`${ws.getDate()} ${MONTHS[ws.getMonth()]} – ${we.getDate()} ${MONTHS[we.getMonth()]} ${we.getFullYear()}`, x0 + gw - 26, y0 + headH / 2);
+  ctx.textAlign = 'left';
+  // day headers + cells
+  const wk = W(); const today = new Date(); today.setHours(0, 0, 0, 0);
+  for (let d = 0; d < 7; d++) {
+    const cx = x0 + d * colW, date = addDays(ws, d);
+    ctx.fillStyle = light.dc[d]; ctx.fillRect(cx, y0 + headH, colW, dayH);
+    ctx.fillStyle = light.green; ctx.font = `700 30px ${hand}`; ctx.textAlign = 'center';
+    ctx.fillText(`${DAYS_S[d]} ${date.getDate()}`, cx + colW / 2, y0 + headH + dayH / 2); ctx.textAlign = 'left';
+    MEALS.forEach(([m, label], i) => {
+      const cy = y0 + headH + dayH + i * rowH; const sl = wk.slots[d + m]; const r = meal(sl);
+      ctx.fillStyle = light.week; ctx.font = `600 11px ${ui}`; ctx.fillText(label.toUpperCase(), cx + 12, cy + 18);
+      if (!r) return;
+      ctx.fillStyle = light.heading; ctx.font = `700 26px ${hand}`;
+      let ty = cy + 46; const lines = wrapText(ctx, r.name, colW - 24, sl.dessert ? 3 : 4);
+      for (const ln of lines) { ctx.fillText(ln, cx + 12, ty); ty += 25; }
+      if (sl.dessert) { for (const ln of wrapText(ctx, sl.dessert.name, colW - 24, 2)) { ctx.fillText(ln, cx + 12, ty); ty += 25; } }
+      // dots
+      let dx = cx + 16; const dy = cy + rowH - 18;
+      const dots = g => { for (const k of GK) for (let n = 0; n < (g[k] || 0); n++) { ctx.fillStyle = gcol[k]; ctx.beginPath(); ctx.arc(dx, dy, 5, 0, Math.PI * 2); ctx.fill(); dx += 14; } };
+      dots(r.g); if (sl.dessert) dots(sl.dessert.g || { sugar: 1 });
+    });
+  }
+  // grid lines
+  ctx.strokeStyle = light.green; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(x0, y0 + headH + dayH + 0.5); ctx.lineTo(x0 + gw, y0 + headH + dayH + 0.5); ctx.stroke();
+  ctx.strokeStyle = light.stroke;
+  for (let d = 1; d < 7; d++) { ctx.beginPath(); ctx.moveTo(Math.round(x0 + d * colW) + 0.5, y0 + headH); ctx.lineTo(Math.round(x0 + d * colW) + 0.5, y0 + headH + dayH + rowH * 2); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(x0, y0 + headH + dayH + rowH + 0.5); ctx.lineTo(x0 + gw, y0 + headH + dayH + rowH + 0.5); ctx.stroke();
+  ctx.restore();
+  ctx.strokeStyle = light.green; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(x0, y0, gw, headH + dayH + rowH * 2, 12); ctx.stroke();
+  // footer: mascot + wordmark
+  const fy = y0 + headH + dayH + rowH * 2 + 30;
+  try {
+    const svg = document.querySelector('.brand-mark');
+    if (svg) {
+      const src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(new XMLSerializer().serializeToString(svg));
+      const img = new Image(); await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = src; });
+      ctx.drawImage(img, x0, fy - 14, 20, 28);
+    }
+  } catch (e) {}
+  ctx.fillStyle = light.green; ctx.font = `600 22px "Fredoka", ${ui}`; ctx.textBaseline = 'middle'; ctx.fillText('ciboo', x0 + 28, fy + 1);
+  ctx.fillStyle = light.micro; ctx.font = `400 13px ${ui}`; ctx.textAlign = 'right'; ctx.fillText('Our lunches and dinners this week', x0 + gw, fy + 1);
+  return new Promise(res => cv.toBlob(res, 'image/png'));
+}
+async function shareImage() {
+  const st = $('sPlanState'); st.textContent = 'Making the picture…';
+  try {
+    const blob = await drawWeekImage(); if (!blob) throw new Error('no image');
+    const name = `ciboo-week-${isoWeek(WS())}.png`;
+    const file = new File([blob], name, { type: 'image/png' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file], title: `Our meals, week ${isoWeek(WS())}` }); st.textContent = 'Shared.'; return; }
+      catch (e) { if (e && e.name === 'AbortError') { st.textContent = ''; return; } }
+    }
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    st.textContent = `Saved ${name}. Send it like any photo.`;
+  } catch (e) { st.textContent = 'Could not make the picture here. Try Copy link instead.'; }
+}
+
 function renderLegend() {
   $('dotLegend').innerHTML = '<span class="lab">Dots show portions:</span>' + GROUPS.map(g => `<span><i style="background:${color(g.k)}"></i>${g.name}</span>`).join('');
 }
@@ -945,6 +1104,7 @@ function buildMessage() {
 }
 function renderShare() {
   $('sMsg').value = buildMessage();
+  $('sPlanSec').hidden = !!window.claude; $('sPlanDiv').hidden = !!window.claude; $('sLinkField').hidden = true;
   const key = weekKey(state.weekStart);
   const text = $('sLiveText'), row = $('sLiveRow');
   $('sLiveSec').hidden = !!view || !window.claude;
@@ -1240,6 +1400,12 @@ $('week').onclick = e => {
   const open = e.target.closest('[data-slot]'); if (open) openModal(open.dataset.slot);
 };
 $('shareBtn').onclick = openShare;
+$('sLink').onclick = () => {
+  const link = planLink(), st = $('sPlanState'), f = $('sLinkField');
+  const fallback = () => { f.hidden = false; f.value = link; f.focus(); f.select(); st.textContent = 'Copy the link above and send it to anyone.'; };
+  try { navigator.clipboard.writeText(link).then(() => { st.textContent = 'Link copied. Paste it into WhatsApp, a text or an email.'; }, fallback); } catch (e) { fallback(); }
+};
+$('sImg').onclick = shareImage;
 $('sClose').onclick = closeShare;
 $('shareScrim').onclick = e => { if (e.target === $('shareScrim')) closeShare(); };
 $('sCopy').onclick = () => {
@@ -1266,6 +1432,7 @@ $('sLiveRow').onclick = e => {
 };
 $('sharedStrip').onclick = e => {
   const v = e.target.closest('[data-view]'); if (v) { enterView(v.dataset.view); return; }
+  if (e.target.closest('#addLinked')) { addLinkedMeals(); return; }
   if (e.target.closest('#leaveView')) leaveView();
 };
 $('mClose').onclick = closeModal;
@@ -1280,7 +1447,8 @@ const savedSettings = LS.get('settings');
 if (savedSettings) state.settings = { diet: savedSettings.diet || 'all', targets: { ...defaultTargets(), ...(savedSettings.targets || {}) }, custom: savedSettings.custom || [] };
 loadWeekLocal();
 renderLegend();
-render();
+if (!checkPlanHash()) render();
+window.addEventListener('hashchange', () => { if (location.hash.startsWith('#plan=')) checkPlanHash(); });
 connect();
 })();
 </script>
